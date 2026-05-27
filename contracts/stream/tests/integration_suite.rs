@@ -4333,6 +4333,109 @@ fn snapshot_event_rate_end_topup_recp() {
 }
 
 #[test]
+fn update_rate_rejects_equal_and_zero_rates() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let equal_rate_result = ctx
+        .client()
+        .try_update_rate_per_second(&stream_id, &1_i128);
+    assert_eq!(equal_rate_result, Err(Ok(ContractError::InvalidParams)));
+
+    let zero_rate_result = ctx
+        .client()
+        .try_update_rate_per_second(&stream_id, &0_i128);
+    assert_eq!(zero_rate_result, Err(Ok(ContractError::InvalidParams)));
+}
+
+#[test]
+fn update_rate_accepts_maximum_i128_rate() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &i128::MAX,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1u64,
+        &0,
+        &None,
+    );
+
+    ctx.client().update_rate_per_second(&stream_id, &i128::MAX);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.rate_per_second, i128::MAX);
+    assert_eq!(state.status, StreamStatus::Active);
+}
+
+#[test]
+fn update_rate_on_paused_stream_is_allowed() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client()
+        .pause_stream(&stream_id, &PauseReason::Operational);
+    ctx.client().update_rate_per_second(&stream_id, &2_i128);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+    assert_eq!(state.rate_per_second, 2_i128);
+}
+
+#[test]
+fn update_rate_rejected_on_cancelled_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().cancel_stream(&stream_id);
+    let result = ctx
+        .client()
+        .try_update_rate_per_second(&stream_id, &2_i128);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
+
+proptest::proptest! {
+    #[test]
+    fn update_rate_accepts_monotonic_increase_sequences(
+        mut rates in proptest::collection::vec(1_i128..1000, 2..6)
+    ) {
+        rates.sort();
+        rates.dedup();
+        proptest::prop_assume!(rates.len() >= 2);
+
+        let ctx = TestContext::setup();
+        ctx.env.ledger().set_timestamp(0);
+
+        let duration = 10u64;
+        let deposit = rates.last().unwrap().checked_mul(duration as i128).unwrap();
+        let stream_id = ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &deposit,
+            &rates[0],
+            &0u64,
+            &0u64,
+            &duration,
+            &0,
+            &None,
+        );
+
+        for &next_rate in rates.iter().skip(1) {
+            ctx.client().update_rate_per_second(&stream_id, &next_rate);
+            let state = ctx.client().get_stream_state(&stream_id);
+            proptest::prop_assert_eq!(state.rate_per_second, next_rate);
+            proptest::prop_assert!(state.status == StreamStatus::Active || state.status == StreamStatus::Paused);
+        }
+    }
+}
+
+#[test]
 fn snapshot_event_admin_and_pause_ctl() {
     let ctx = TestContext::setup();
 

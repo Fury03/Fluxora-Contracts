@@ -7,6 +7,8 @@ Every pull request and push to `main`/`develop` must meet this threshold or the 
 
 Current baseline: **96.4%** (644/668 lines — see `coverage/cobertura.xml`).
 
+> New stream contract coverage includes boundary tests for `update_rate_per_second`: rejecting equal and zero rates, accepting `i128::MAX` when deposit coverage holds, allowing paused-stream updates, rejecting cancelled streams, and exercising monotonic rate sequences with `proptest`.
+
 ---
 
 ## Running Coverage Locally
