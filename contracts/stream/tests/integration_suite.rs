@@ -1,5 +1,16 @@
-use fluxora_stream::{FluxoraStream, FluxoraStreamClient, CreateStreamParams, CreateStreamRelativeParams};
-use soroban_sdk::{testutils::{Address as _, Events}, vec, Address, Env, token::Client as TokenClient};
+extern crate std;
+
+use fluxora_stream::{
+    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, PauseReason, StreamHealth,
+    StreamStatus,
+};
+use proptest::prelude::*;
+use soroban_sdk::log;
+use soroban_sdk::{
+    testutils::{Address as _, Events, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
+    vec, Address, Env, FromVal, IntoVal,
+};
 
 struct TestContext<'a> {
     env: Env,
@@ -413,4 +424,74 @@ fn sweep_excess_after_stream_completion() {
     assert_eq!(swept, 100);
     assert_eq!(ctx.token.balance(&sweep_recipient), 100);
     assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn get_stream_health_returns_correct_summary_active() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 tokens, 0-1000s, rate 1
+
+    ctx.env.ledger().set_timestamp(500);
+    let health = ctx.client().get_stream_health(&stream_id);
+
+    assert_eq!(health.is_underfunded, false);
+    assert_eq!(health.is_expired, false);
+    assert_eq!(health.accrued_to_date, 500);
+    assert_eq!(health.remaining_deposit, 1000);
+    assert_eq!(health.seconds_until_depletion, Some(500));
+}
+
+#[test]
+fn get_stream_health_returns_correct_summary_underfunded() {
+    let ctx = TestContext::setup();
+    // Create an underfunded stream: 1000 tokens, but rate 2 for 1000s (needs 2000)
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &2_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+        &0,
+        &None,
+    );
+
+    ctx.env.ledger().set_timestamp(300);
+    let health = ctx.client().get_stream_health(&stream_id);
+
+    assert_eq!(health.is_underfunded, true);
+    assert_eq!(health.is_expired, false);
+    assert_eq!(health.accrued_to_date, 600);
+    assert_eq!(health.remaining_deposit, 1000);
+    // Depletion at 500s (1000 / 2). 500 - 300 = 200
+    assert_eq!(health.seconds_until_depletion, Some(200));
+}
+
+#[test]
+fn get_stream_health_returns_correct_summary_expired() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1200);
+    let health = ctx.client().get_stream_health(&stream_id);
+
+    assert_eq!(health.is_underfunded, false);
+    assert_eq!(health.is_expired, true);
+    assert_eq!(health.accrued_to_date, 1000);
+    assert_eq!(health.remaining_deposit, 1000);
+    assert_eq!(health.seconds_until_depletion, Some(0));
+}
+
+#[test]
+fn get_stream_health_returns_correct_summary_with_withdrawn_amount() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id);
+    
+    let health = ctx.client().get_stream_health(&stream_id);
+    assert_eq!(health.accrued_to_date, 500);
+    assert_eq!(health.remaining_deposit, 500);
 }
