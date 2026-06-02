@@ -197,195 +197,129 @@ pub fn calculate_accrued_amount_checkpointed(
         .max(0)
 }
 
-/// Error type for accrual calculation failures.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum AccrualError {
-    /// The rate per second is negative or zero.
-    InvalidRate = 1,
-    /// The schedule is invalid (start >= end).
-    InvalidSchedule = 2,
-    /// The deposit amount is negative or zero.
-    InvalidDeposit = 3,
-    /// Overflow occurred during accrual calculation.
-    Overflow = 4,
-}
+// Kani formal proofs (bounded model checking harnesses).
+// These are compiled only when the `kani` cfg is active and are intended
+// to provide machine-checked guarantees about arithmetic and clamping.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    // Kani provides `kani::any` and `kani::assume` helpers in the harness
+    // environment. The proofs below bound inputs to reasonable ranges to
+    // keep the state space tractable while covering relevant edge cases.
 
-// Result type for accrual calculations.
-pub type AccrualResult<T> = Result<T, AccrualError>;
+    // Prove that the function never panics and always returns a value in [0, deposit_amount].
+    #[kani::proof]
+    fn proof_result_in_bounds() {
+        let checkpointed_amount: i128 = kani::any();
+        let checkpointed_at: u64 = kani::any();
+        let cliff_time: u64 = kani::any();
+        let end_time: u64 = kani::any();
+        let deposit_amount: i128 = kani::any();
+        let rate_per_second: i128 = kani::any();
+        let now: u64 = kani::any();
 
-/// Validates stream parameters before accrual calculation.
-///
-/// Returns `Ok(())` if all parameters are valid, or `Err(AccrualError)` otherwise.
-///
-/// # Validation Rules
-/// - `rate_per_second` must be > 0
-/// - `start_time` must be < `end_time`
-/// - `deposit_amount` must be > 0
-/// - `cliff_time` must be in `[start_time, end_time]`
-pub fn validate_stream_params(
-    start_time: u64,
-    cliff_time: u64,
-    end_time: u64,
-    rate_per_second: i128,
-    deposit_amount: i128,
-) -> AccrualResult<()> {
-    if rate_per_second <= 0 {
-        return Err(AccrualError::InvalidRate);
-    }
-    if start_time >= end_time {
-        return Err(AccrualError::InvalidSchedule);
-    }
-    if deposit_amount <= 0 {
-        return Err(AccrualError::InvalidDeposit);
-    }
-    if cliff_time < start_time || cliff_time > end_time {
-        return Err(AccrualError::InvalidSchedule);
-    }
-    Ok(())
-}
+        // Bound values for tractability
+        kani::assume(deposit_amount >= 0);
+        kani::assume(deposit_amount <= 1_000_000_000_000_000_000_i128); // 1e18-ish
+        kani::assume(rate_per_second >= -1_000_000_000_000_000_000_i128);
+        kani::assume(rate_per_second <= 1_000_000_000_000_000_000_i128);
+        kani::assume(checkpointed_amount >= 0);
+        kani::assume(checkpointed_amount <= deposit_amount);
+        kani::assume(checkpointed_at <= end_time);
 
-/// Calculates the maximum possible accrued amount for a stream.
-///
-/// This is the theoretical maximum if the stream runs to completion:
-/// ```text
-/// max_accrued = rate_per_second * (end_time - start_time)
-/// ```
-///
-/// # Balance Conservation Note
-/// The actual `deposit_amount` may exceed `max_accrued` (excess deposit).
-/// In this case, the excess is sweepable by the admin and does not affect
-/// the recipient's entitlement. The invariant still holds because:
-/// ```text
-/// deposit_amount = max_accrued + excess
-///                  = (rate * duration) + excess
-/// ```
-pub fn calculate_max_accrued(
-    start_time: u64,
-    end_time: u64,
-    rate_per_second: i128,
-) -> AccrualResult<i128> {
-    if start_time >= end_time {
-        return Err(AccrualError::InvalidSchedule);
-    }
-    if rate_per_second <= 0 {
-        return Err(AccrualError::InvalidRate);
+        let state = CheckpointState {
+            checkpointed_amount,
+            checkpointed_at,
+            cliff_time,
+            end_time,
+            deposit_amount,
+        };
+
+        // Call the function under test. Kani will flag panics or UB.
+        let out = calculate_accrued_amount_checkpointed(state, rate_per_second, deposit_amount, now);
+
+        // Assert bounds: non-negative and <= deposit_amount
+        kani::assert!(out >= 0);
+        kani::assert!(out <= deposit_amount);
     }
 
-    let duration = (end_time - start_time) as i128;
-    duration
-        .checked_mul(rate_per_second)
-        .ok_or(AccrualError::Overflow)
-}
+    // Prove monotonicity: for t1 <= t2 (both >= cliff and <= end), accrued(t1) <= accrued(t2)
+    #[kani::proof]
+    fn proof_monotonicity_after_cliff() {
+        let checkpointed_amount: i128 = kani::any();
+        let checkpointed_at: u64 = kani::any();
+        let cliff_time: u64 = kani::any();
+        let end_time: u64 = kani::any();
+        let deposit_amount: i128 = kani::any();
+        let rate_per_second: i128 = kani::any();
+        let t1: u64 = kani::any();
+        let t2: u64 = kani::any();
 
+        kani::assume(deposit_amount >= 0);
+        kani::assume(deposit_amount <= 1_000_000_000_000_000_000_i128);
+        kani::assume(rate_per_second >= 0); // non-negative rates for monotonicity
+        kani::assume(rate_per_second <= 1_000_000_000_000_000_000_i128);
+        kani::assume(checkpointed_amount >= 0 && checkpointed_amount <= deposit_amount);
+        kani::assume(checkpointed_at <= end_time);
 
-/// Calculates the refund amount on cancel.
-///
-/// When a stream is cancelled, the sender receives back all unstreamed tokens:
-/// ```text
-/// refund = deposit_amount - accrued_at_cancel_time
-/// ```
-///
-/// # Balance Conservation
-/// This ensures the total token accounting is preserved:
-/// ```text
-/// tokens_out = refund (to sender) + withdrawn (to recipient)
-/// tokens_remaining = accrued_at_cancel - withdrawn
-/// total = refund + withdrawn + tokens_remaining
-///       = (deposit - accrued) + withdrawn + (accrued - withdrawn)
-///       = deposit  ✓
-/// ```
-pub fn calculate_cancel_refund(
-    deposit_amount: i128,
-    accrued_at_cancel: i128,
-) -> AccrualResult<i128> {
-    if accrued_at_cancel > deposit_amount {
-        // This should never happen due to clamping in calculate_accrued_amount_checkpointed,
-        // but we handle it defensively.
-        return Ok(0);
-    }
-    Ok(deposit_amount - accrued_at_cancel)
-}
+        // constrain t1 <= t2 and both in [cliff, end]
+        kani::assume(cliff_time <= end_time);
+        kani::assume(t1 >= cliff_time && t1 <= end_time);
+        kani::assume(t2 >= t1 && t2 <= end_time);
 
-/// Calculates the refund amount on shorten.
-///
-/// When a stream's end time is shortened, the sender receives back tokens
-/// that would have been streamed after the new end time:
-/// ```text
-/// refund = old_deposit - new_deposit
-/// new_deposit = rate_per_second * (new_end - start_time)
-/// ```
-///
-/// # Balance Conservation
-/// The recipient's already-accrued entitlement is unchanged. Only future
-/// unstreamed tokens are refunded.
-pub fn calculate_shorten_refund(
-    start_time: u64,
-    old_end: u64,
-    new_end: u64,
-    rate_per_second: i128,
-    old_deposit: i128,
-) -> AccrualResult<i128> {
-    if new_end <= start_time || new_end >= old_end {
-        return Err(AccrualError::InvalidSchedule);
-    }
-    if rate_per_second <= 0 {
-        return Err(AccrualError::InvalidRate);
+        let state = CheckpointState {
+            checkpointed_amount,
+            checkpointed_at,
+            cliff_time,
+            end_time,
+            deposit_amount,
+        };
+
+        let a = calculate_accrued_amount_checkpointed(state, rate_per_second, deposit_amount, t1);
+        let b = calculate_accrued_amount_checkpointed(state, rate_per_second, deposit_amount, t2);
+
+        kani::assert!(a <= b);
     }
 
-    let new_duration = (new_end - start_time) as i128;
-    let new_deposit = new_duration
-        .checked_mul(rate_per_second)
-        .ok_or(AccrualError::Overflow)?;
+    // Prove clamping at cliff and end: before cliff => 0, at or after end => <= deposit
+    #[kani::proof]
+    fn proof_clamping_cliff_end() {
+        let checkpointed_amount: i128 = kani::any();
+        let checkpointed_at: u64 = kani::any();
+        let cliff_time: u64 = kani::any();
+        let end_time: u64 = kani::any();
+        let deposit_amount: i128 = kani::any();
+        let rate_per_second: i128 = kani::any();
+        let now_before: u64 = kani::any();
+        let now_after: u64 = kani::any();
 
-    if new_deposit > old_deposit {
-        // This should not happen if parameters are valid
-        return Ok(0);
+        kani::assume(deposit_amount >= 0);
+        kani::assume(deposit_amount <= 1_000_000_000_000_000_000_i128);
+        kani::assume(rate_per_second >= -1_000_000_000_000_000_000_i128);
+        kani::assume(checkpointed_amount >= 0 && checkpointed_amount <= deposit_amount);
+        kani::assume(checkpointed_at <= end_time);
+        kani::assume(cliff_time <= end_time);
+
+        // before cliff
+        kani::assume(now_before < cliff_time);
+
+        let state = CheckpointState {
+            checkpointed_amount,
+            checkpointed_at,
+            cliff_time,
+            end_time,
+            deposit_amount,
+        };
+
+        let out_before = calculate_accrued_amount_checkpointed(state, rate_per_second, deposit_amount, now_before);
+        kani::assert!(out_before == 0);
+
+        // at or after end
+        kani::assume(now_after >= end_time);
+        let out_after = calculate_accrued_amount_checkpointed(state, rate_per_second, deposit_amount, now_after);
+        kani::assert!(out_after >= 0);
+        kani::assert!(out_after <= deposit_amount);
     }
-
-    Ok(old_deposit - new_deposit)
-}
-
-/// Calculates the new deposit and refund on rate decrease.
-///
-/// When the rate is decreased, the contract:
-/// 1. Locks in already-accrued amount as `checkpointed_amount`
-/// 2. Computes new deposit: `checkpointed + new_rate * remaining_duration`
-/// 3. Refunds: `old_deposit - new_deposit`
-///
-/// # Balance Conservation
-/// The recipient's entitlement up to the checkpoint time is preserved.
-/// Only future unstreamed tokens at the old rate are affected.
-pub fn calculate_rate_decrease_refund(
-    checkpointed_amount: i128,
-    checkpointed_at: u64,
-    end_time: u64,
-    old_rate: i128,
-    new_rate: i128,
-    old_deposit: i128,
-) -> AccrualResult<(i128, i128)> {
-    if new_rate >= old_rate || new_rate <= 0 {
-        return Err(AccrualError::InvalidRate);
-    }
-    if checkpointed_at >= end_time {
-        return Err(AccrualError::InvalidSchedule);
-    }
-
-    let remaining_duration = (end_time - checkpointed_at) as i128;
-    let new_future_deposit = remaining_duration
-        .checked_mul(new_rate)
-        .ok_or(AccrualError::Overflow)?;
-
-    let new_deposit = checkpointed_amount
-        .checked_add(new_future_deposit)
-        .ok_or(AccrualError::Overflow)?;
-
-    // Clamp to old_deposit (should not exceed it)
-    let new_deposit = new_deposit.min(old_deposit);
-    let refund = old_deposit - new_deposit;
-
-    Ok((new_deposit, refund))
 }
 
 #[cfg(test)]
