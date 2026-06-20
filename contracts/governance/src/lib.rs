@@ -90,6 +90,8 @@ pub enum GovernanceError {
     InvalidThreshold = 15,
     /// Removing this signer would leave fewer signers than the required threshold.
     QuorumWouldBreak = 16,
+    /// Signer is already registered in the co-signer set.
+    DuplicateSigner = 17,
 }
 
 /// Storage keys for the governance contract.
@@ -264,13 +266,14 @@ impl FluxoraGovernance {
     /// # Parameters
     /// - `admin`: Address that can add/remove signers and reset governance state.
     /// - `signers`: Initial list of co-signers eligible to approve proposals.
-    ///   Must not exceed `MAX_SIGNERS`.
+    ///   Must not exceed `MAX_SIGNERS` and must not contain duplicates.
     /// - `threshold`: Minimum number of approvals required for a proposal to
     ///   execute.  Must satisfy `1 <= threshold <= signers.len()`.
     ///
     /// # Errors
     /// - `AlreadyInitialized`: Contract has already been initialised.
     /// - `TooManySigners`: Provided signer list exceeds `MAX_SIGNERS`.
+    /// - `DuplicateSigner`: Provided signer list contains the same address twice.
     /// - `InvalidThreshold`: `threshold` is zero or exceeds the number of signers.
     pub fn init(
         env: Env,
@@ -284,6 +287,7 @@ impl FluxoraGovernance {
         if signers.len() > MAX_SIGNERS {
             return Err(GovernanceError::TooManySigners);
         }
+        Self::require_unique_signers(&signers)?;
         if threshold == 0 || threshold > signers.len() {
             return Err(GovernanceError::InvalidThreshold);
         }
@@ -310,14 +314,20 @@ impl FluxoraGovernance {
 
     /// Add a co-signer to the governance set.
     ///
+    /// The signer set is unique: an address may occupy at most one co-signer slot.
+    ///
     /// # Authorization
     /// - Requires admin signature.
     ///
     /// # Errors
     /// - `TooManySigners`: Adding this signer would exceed `MAX_SIGNERS`.
+    /// - `DuplicateSigner`: `signer` is already registered.
     pub fn add_signer(env: Env, signer: Address) -> Result<(), GovernanceError> {
         get_admin(&env)?.require_auth();
         let mut signers = get_signers(&env)?;
+        if Self::is_signer(&signers, &signer) {
+            return Err(GovernanceError::DuplicateSigner);
+        }
         if signers.len() >= MAX_SIGNERS {
             return Err(GovernanceError::TooManySigners);
         }
@@ -687,6 +697,18 @@ impl FluxoraGovernance {
             }
         }
         false
+    }
+
+    fn require_unique_signers(signers: &Vec<Address>) -> Result<(), GovernanceError> {
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            for j in (i + 1)..signers.len() {
+                if signers.get(j).unwrap() == signer {
+                    return Err(GovernanceError::DuplicateSigner);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
