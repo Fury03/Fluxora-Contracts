@@ -194,21 +194,53 @@ bytes, emits them in `ProposalExecuted`, and enforces only the size bound
 `MAX_CALLDATA_BYTES = 4,096`. It does not decode function names, validate target ABI, or
 perform a generic runtime call into `target`.
 
-The recommended client contract for calldata is:
+For protocol executors, the calldata convention is:
 
-1. Encode the intended downstream operation deterministically, including target entrypoint
-   and arguments. For example, an executor adapter may define `set_cap(i128)` as a small
-   tagged payload, or use a fixed XDR schema shared by wallets, indexers, and bots.
-2. Show the decoded intent to signers before `propose` and `approve`.
-3. Persist the exact bytes in the proposal. Indexers should treat the bytes emitted by
-   `ProposalExecuted` as the audited payload that must match the proposal record.
-4. Have the off-chain bot or typed on-chain adapter decode the bytes and decide whether to
-   call the `target` contract.
+1. Treat the bytes as an opaque payload that encodes one downstream contract call.
+2. Use a deterministic byte layout of `function_selector || encoded_args`.
+3. The `function_selector` is the first 4 bytes of the SHA-256 hash of the canonical
+   entrypoint signature, using the exact Rust/Soroban ABI signature string.
+4. The `encoded_args` are the entrypoint arguments encoded in the same order and type system
+   that the target contract expects. For the stream contract, the `set_max_rate_per_second`
+   entrypoint takes a single `i128` argument, so the argument payload is the 16-byte
+   big-endian encoding of that integer.
+5. The executor must read `target` from the proposal, map it to the contract address it is
+   authorized to call, and dispatch the downstream transaction with the decoded selector and
+   arguments. The governance contract itself never performs this dispatch.
+
+The byte layout is therefore:
+
+```text
+calldata = function_selector[4 bytes] || encoded_args[...]
+```
+
+Worked example: changing the stream contract's global rate cap to `1_000`.
+
+- Target contract: the stream contract address recorded in the proposal `target`.
+- Entrypoint: `set_max_rate_per_second(max_rate: i128)`.
+- Function selector: SHA-256(`set_max_rate_per_second(i128)`)[0..4] = `0x6c2c74d6`.
+- Argument encoding: `1_000` as a signed 128-bit integer =
+  `0x000000000000000000000000000003e8`.
+- Final calldata bytes: `0x6c2c74d60000000000000000000000000000000000000000000000000003e8`.
+
+An executor should interpret the proposal as:
+
+```text
+call target.set_max_rate_per_second(1000)
+```
+
+where `target` is the contract address from the proposal and the calldata bytes above are the
+payload passed to that contract entrypoint.
 
 Security boundary: a successful `execute` call records governance consensus and emits an
-auditable payload. It does not prove that the downstream factory or stream change has
-already happened unless a separate adapter transaction or typed dispatch performs that call
-and emits its own event.
+auditable payload. It does not prove that the downstream stream or factory change has already
+happened unless a separate executor transaction performs that call and emits its own event.
+
+Malformed, truncated, or oversized calldata must be rejected by the off-chain executor before
+submitting the downstream transaction. The governance contract only enforces the bytes size
+bound; it does not validate that the calldata decodes to a known entrypoint or argument list.
+
+For selector stability and ABI compatibility expectations, see [`ABI_STABILITY.md`](ABI_STABILITY.md).
 
 ## Integration with the factory
 
